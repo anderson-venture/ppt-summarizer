@@ -1,21 +1,29 @@
 import { Marked } from "marked";
-import puppeteer from "puppeteer";
 import fs from "node:fs";
 import path from "node:path";
 import { CONFIG } from "./config.js";
 
 const marked = new Marked();
 
-export async function generatePDF(
-  markdown: string,
-  outputPath: string
-): Promise<void> {
-  console.log("[pdf-out] Converting notes to PDF...");
+export type OutputFormat = "pdf" | "html";
 
-  // Convert image references from ![caption](img-X-Y.png) to base64 inline
+export async function generateOutput(
+  markdown: string,
+  outputPath: string,
+  format: OutputFormat
+): Promise<void> {
   const html = await markdownToHtml(markdown);
   const styledHtml = wrapInTemplate(html);
 
+  if (format === "html") {
+    fs.writeFileSync(outputPath, styledHtml);
+    console.log(`[out] HTML saved to ${outputPath}`);
+    return;
+  }
+
+  // PDF path — lazy-import puppeteer so HTML mode never needs Chrome
+  console.log("[out] Rendering PDF via Puppeteer...");
+  const puppeteer = await import("puppeteer");
   const browser = await puppeteer.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
@@ -38,14 +46,13 @@ export async function generatePDF(
         </div>`,
     });
 
-    console.log(`[pdf-out] Saved to ${outputPath}`);
+    console.log(`[out] PDF saved to ${outputPath}`);
   } finally {
     await browser.close();
   }
 }
 
 async function markdownToHtml(md: string): Promise<string> {
-  // Replace image references with base64-encoded inline images
   const imgPattern = /!\[([^\]]*)\]\(([^)]+)\)/g;
   let processed = md;
 
@@ -71,6 +78,7 @@ function wrapInTemplate(bodyHtml: string): string {
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<title>Study Notes</title>
 <style>
   @page {
     size: A4;
@@ -86,9 +94,13 @@ function wrapInTemplate(bodyHtml: string): string {
     font-size: 11pt;
     line-height: 1.55;
     color: #1a1a1a;
-    max-width: 100%;
-    padding: 0;
-    margin: 0;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 24px;
+  }
+
+  @media print {
+    body { max-width: 100%; padding: 0; }
   }
 
   h1 {

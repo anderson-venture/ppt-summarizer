@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/index.ts",
-    "generate": "tsx src/index.ts"
+    "generate": "tsx src/index.ts",
+    "generate:html": "tsx src/index.ts --format html",
+    "generate:pdf": "tsx src/index.ts --format pdf"
   },
   "dependencies": {
     "marked": "^15.0.0",

@@ -4,15 +4,15 @@ import path from "node:path";
 import { CONFIG } from "./config.js";
 import { processPDF } from "./pdf-processor.js";
 import { analyzeAndSynthesize } from "./llm-analyzer.js";
-import { generatePDF } from "./pdf-writer.js";
+import { generateOutput, type OutputFormat } from "./pdf-writer.js";
 
 async function main() {
   const t0 = performance.now();
 
-  // ── Resolve input PDF ──
-  const inputArg = process.argv[2];
-  const pdfPath = resolveInput(inputArg);
-  console.log(`\nInput: ${pdfPath}\n`);
+  const { inputPath, format } = parseArgs();
+  const pdfPath = resolveInput(inputPath);
+  console.log(`\nInput:  ${pdfPath}`);
+  console.log(`Format: ${format}\n`);
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey || apiKey === "your-api-key-here") {
@@ -30,22 +30,20 @@ async function main() {
 
   // ── Step 2 & 3: LLM vision analysis + note synthesis ──
   const t2 = performance.now();
-  const { studyNotes, costEstimate } = await analyzeAndSynthesize(
-    pages,
-    apiKey
-  );
+  const { studyNotes, costEstimate } = await analyzeAndSynthesize(pages, apiKey);
   const step23Time = ((performance.now() - t2) / 1000).toFixed(1);
   console.log(`  Steps 2-3 took ${step23Time}s\n`);
 
-  // Save the raw markdown as well
+  // Always save the raw markdown
   const mdPath = path.join(CONFIG.outputDir, "study-notes.md");
   fs.writeFileSync(mdPath, studyNotes);
   console.log(`[out] Markdown saved to ${mdPath}`);
 
-  // ── Step 4: Generate PDF ──
+  // ── Step 4: Generate final output ──
   const t3 = performance.now();
-  const outPdf = path.join(CONFIG.outputDir, "study-notes.pdf");
-  await generatePDF(studyNotes, outPdf);
+  const ext = format === "html" ? "html" : "pdf";
+  const outFile = path.join(CONFIG.outputDir, `study-notes.${ext}`);
+  await generateOutput(studyNotes, outFile, format);
   const step4Time = ((performance.now() - t3) / 1000).toFixed(1);
   console.log(`  Step 4 took ${step4Time}s\n`);
 
@@ -56,8 +54,30 @@ async function main() {
   console.log(`  Pages:        ${pages.length}`);
   console.log(`  Images:       ${totalImages}`);
   console.log(`  API cost:     $${costEstimate.toFixed(4)}`);
-  console.log(`  Output:       ${outPdf}`);
+  console.log(`  Output:       ${outFile}`);
   console.log("─".repeat(48));
+}
+
+function parseArgs(): { inputPath?: string; format: OutputFormat } {
+  const args = process.argv.slice(2);
+  let inputPath: string | undefined;
+  let format: OutputFormat = "pdf";
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--format" && args[i + 1]) {
+      const val = args[i + 1].toLowerCase();
+      if (val !== "pdf" && val !== "html") {
+        console.error(`Invalid format "${val}". Use "pdf" or "html".`);
+        process.exit(1);
+      }
+      format = val;
+      i++;
+    } else if (!args[i].startsWith("--")) {
+      inputPath = args[i];
+    }
+  }
+
+  return { inputPath, format };
 }
 
 function resolveInput(arg?: string): string {
@@ -70,16 +90,15 @@ function resolveInput(arg?: string): string {
     return abs;
   }
 
-  // Look for any PDF in the input directory
-  const files = fs.readdirSync(CONFIG.inputDir).filter((f) =>
-    f.toLowerCase().endsWith(".pdf")
-  );
+  const files = fs
+    .readdirSync(CONFIG.inputDir)
+    .filter((f) => f.toLowerCase().endsWith(".pdf"));
 
   if (files.length === 0) {
     console.error(
       `No PDF found. Either:\n` +
         `  - Place a PDF in ./input/\n` +
-        `  - Or pass a path: npm run generate -- path/to/file.pdf`
+        `  - Or pass a path: npx tsx src/index.ts path/to/file.pdf`
     );
     process.exit(1);
   }

@@ -235,18 +235,23 @@ async function synthesizeNotes(
   const messages: ChatCompletionMessageParam[] = [
     {
       role: "system",
-      content: `You are an expert at condensing university lectures into short, high-yield exam study notes. Your job is to SUMMARIZE — not reproduce. Distill 60 slides down to a compact cheat-sheet a student can review in 15 minutes.`,
+      content: `You are an expert at condensing university lectures into short, high-yield exam study notes. Distill slides into a compact cheat-sheet a student can review in 15 minutes. Diagrams are placed INLINE next to the concept they illustrate — never in a separate section.`,
     },
     {
       role: "user",
-      content: `Summarize this ${pages.length}-slide microbiology lecture into a concise study note.
+      content: `Summarize this ${pages.length}-slide lecture into a concise study note.
 
-RULES:
-1. **Condense aggressively**. Merge related slides. Drop filler, repetition, and obvious info. Keep only what would appear on an exam.
-2. Use markdown: # title, ## major topics, ### subtopics. Bullet points for facts. Tables where comparisons help.
+CRITICAL FORMATTING RULE:
+- Each diagram MUST be placed IMMEDIATELY AFTER the bullet point or paragraph that discusses that concept.
+- For example, when you explain transformation, place the transformation diagram right there — NOT in a separate "diagrams" section.
+- NEVER create a dedicated images/diagrams section. Images must be woven into the text.
+
+OTHER RULES:
+1. Condense aggressively. Merge related slides. Keep only exam-relevant material.
+2. Use markdown: # title, ## major topics, ### subtopics. Bullet points for facts. Tables for comparisons.
 3. Include key definitions, classifications, numerical facts (pH, temperatures, gene counts, mutation rates), and step-by-step processes.
-4. **Diagrams**: Pick only the ~8-10 most important diagrams from the IMAGE CATALOG and embed them as ![caption](FILENAME). Choose diagrams that show processes, mechanisms, or classifications a student needs to visualize. Skip decorative or redundant images.
-5. Use **bold** for key terms. Keep explanations to 1-2 sentences max — this is a cheat-sheet, not a textbook.
+4. Pick ~8-10 most important diagrams from the IMAGE CATALOG. Embed as ![caption](FILENAME) inline right after the relevant text.
+5. Use **bold** for key terms. Keep explanations to 1-2 sentences max.
 
 --- SLIDE TEXT ---
 ${textContent}
