@@ -11,6 +11,7 @@ export interface ExtractedImage {
   filename: string;
   width: number;
   height: number;
+  byteLength: number;
 }
 
 export interface PageData {
@@ -64,13 +65,15 @@ export async function processPDF(pdfPath: string): Promise<ProcessedPDF> {
 
         totalImages++;
         const id = `img-${pageNum}-${images.length + 1}`;
+        const buf = Buffer.from(pngData);
         images.push({
           id,
           pageNumber: pageNum,
-          buffer: Buffer.from(pngData),
-          filename: `${id}.png`,
+          buffer: buf,
+          filename: `${id}.jpg`,
           width: w,
           height: h,
+          byteLength: buf.length,
         });
       },
     });
@@ -78,18 +81,20 @@ export async function processPDF(pdfPath: string): Promise<ProcessedPDF> {
     pages.push({ pageNumber: pageNum, text, images });
   }
 
-  // Resize large images to reduce LLM payload and save to disk
+  // Resize and convert to JPEG to reduce LLM payload and save to disk
   for (const pg of pages) {
     for (const img of pg.images) {
+      const pipeline = sharp(img.buffer);
       if (img.width > CONFIG.imageMaxWidth) {
-        img.buffer = await sharp(img.buffer)
-          .resize({ width: CONFIG.imageMaxWidth })
-          .png()
-          .toBuffer();
-        const meta = await sharp(img.buffer).metadata();
-        img.width = meta.width ?? img.width;
-        img.height = meta.height ?? img.height;
+        pipeline.resize({ width: CONFIG.imageMaxWidth });
       }
+      img.buffer = await pipeline
+        .jpeg({ quality: CONFIG.imageJpegQuality })
+        .toBuffer();
+      const meta = await sharp(img.buffer).metadata();
+      img.width = meta.width ?? img.width;
+      img.height = meta.height ?? img.height;
+      img.byteLength = img.buffer.length;
       fs.writeFileSync(path.join(CONFIG.imagesDir, img.filename), img.buffer);
     }
   }

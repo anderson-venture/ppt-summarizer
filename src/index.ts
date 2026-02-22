@@ -3,7 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { CONFIG } from "./config.js";
 import { processPDF } from "./pdf-processor.js";
-import { analyzeAndSynthesize } from "./llm-analyzer.js";
+import {
+  analyzeAndSynthesize,
+  type SynthesisPageInput,
+} from "./llm-analyzer.js";
 import { generateOutput, type OutputFormat } from "./pdf-writer.js";
 
 async function main() {
@@ -29,10 +32,44 @@ async function main() {
   console.log(`  Step 1 took ${step1Time}s\n`);
 
   // ── Step 2 & 3: LLM vision analysis + note synthesis ──
-  const t2 = performance.now();
-  const { studyNotes, costEstimate } = await analyzeAndSynthesize(pages, apiKey);
-  const step23Time = ((performance.now() - t2) / 1000).toFixed(1);
-  console.log(`  Steps 2-3 took ${step23Time}s\n`);
+  const {
+    studyNotes,
+    costEstimate,
+    imageDescriptions,
+    synthesisInputPages,
+  } = await analyzeAndSynthesize(pages, apiKey);
+
+  // Save intermediate results
+  const imageDescPath = path.join(CONFIG.outputDir, "image-descriptions.json");
+  fs.writeFileSync(
+    imageDescPath,
+    JSON.stringify(imageDescriptions, null, 2),
+    "utf-8"
+  );
+  console.log(`[out] Image descriptions saved to ${imageDescPath}`);
+
+  const synthInputPath = path.join(
+    CONFIG.outputDir,
+    "synthesis-input-pages.json"
+  );
+  fs.writeFileSync(
+    synthInputPath,
+    JSON.stringify(synthesisInputPages, null, 2),
+    "utf-8"
+  );
+  console.log(`[out] Synthesis input (per-page) saved to ${synthInputPath}`);
+
+  // Also save a readable markdown version of synthesis input
+  const synthInputMdPath = path.join(
+    CONFIG.outputDir,
+    "synthesis-input-pages.md"
+  );
+  fs.writeFileSync(
+    synthInputMdPath,
+    formatSynthesisInputMarkdown(synthesisInputPages),
+    "utf-8"
+  );
+  console.log(`[out] Synthesis input (readable) saved to ${synthInputMdPath}`);
 
   // Always save the raw markdown
   const mdPath = path.join(CONFIG.outputDir, "study-notes.md");
@@ -56,6 +93,19 @@ async function main() {
   console.log(`  API cost:     $${costEstimate.toFixed(4)}`);
   console.log(`  Output:       ${outFile}`);
   console.log("─".repeat(48));
+}
+
+function formatSynthesisInputMarkdown(pages: SynthesisPageInput[]): string {
+  const parts: string[] = [];
+  for (const p of pages) {
+    parts.push(`## Page ${p.pageNumber}\n`);
+    if (p.text) parts.push(p.text.trim(), "\n");
+    for (const img of p.images) {
+      parts.push(`### ${img.filename}\n`, img.description, "\n");
+    }
+    parts.push("\n");
+  }
+  return parts.join("");
 }
 
 function parseArgs(): { inputPath?: string; format: OutputFormat } {

@@ -10,9 +10,14 @@ export const CONFIG = {
   imagesDir: path.join(ROOT, "output", "images"),
 
   model: "gpt-4o-mini" as const,
+  premiumModel: "gpt-4o" as const,
   visionDetail: "low" as const,
-  visionBatchSize: 10,
-  maxConcurrentBatches: 4,
+  visionBatchSize: 5,
+  
+  // Images exceeding either threshold are routed to the premium model
+  complexImageMinWidth: 500,
+  complexImageMinBytes: 102_400, // 100 KB
 
-  imageMaxWidth: 768,
+  imageMaxWidth: 512,
+  imageJpegQuality: 82,
 } as const;

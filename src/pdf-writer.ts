@@ -5,6 +5,34 @@ import { CONFIG } from "./config.js";
 
 const marked = new Marked();
 
+// Render mermaid code blocks as <div class="mermaid"> for client-side rendering
+marked.use({
+  renderer: {
+    code({ text, lang, escaped }) {
+      if (lang === "mermaid") {
+        return `<div class="mermaid">\n${text}\n</div>\n`;
+      }
+      const langString = lang ?? "";
+      const code = escaped ? text : escapeHtml(text);
+      if (!langString) {
+        return `<pre><code>${code}</code></pre>\n`;
+      }
+      return `<pre><code class="language-${escapeHtml(langString)}">${code}</code></pre>\n`;
+    },
+  },
+});
+
+function escapeHtml(html: string): string {
+  const map: Record<string, string> = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  };
+  return html.replace(/[&<>"']/g, (ch) => map[ch] ?? ch);
+}
+
 export type OutputFormat = "pdf" | "html";
 
 export async function generateOutput(
@@ -32,6 +60,21 @@ export async function generateOutput(
   try {
     const page = await browser.newPage();
     await page.setContent(styledHtml, { waitUntil: "networkidle0" });
+
+    // Give Mermaid time to render diagrams (client-side JS)
+    if (styledHtml.includes('class="mermaid"')) {
+      await page
+        .waitForFunction(
+          () => {
+            const el = document.querySelector(".mermaid");
+            return !el || el.querySelector("svg");
+          },
+          { timeout: 10000 }
+        )
+        .catch(() => {
+          /* continue if timeout - diagrams may still render */
+        });
+    }
 
     await page.pdf({
       path: outputPath,
@@ -215,10 +258,26 @@ function wrapInTemplate(bodyHtml: string): string {
     background: #eff6ff;
     color: #1e40af;
   }
+
+  .mermaid {
+    margin: 16px 0;
+    text-align: center;
+  }
+
+  .mermaid svg {
+    max-width: 100%;
+    height: auto;
+  }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 </head>
 <body>
 ${bodyHtml}
+<script>
+  if (typeof mermaid !== 'undefined') {
+    mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+  }
+</script>
 </body>
 </html>`;
 }
