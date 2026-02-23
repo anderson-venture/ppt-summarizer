@@ -7,10 +7,8 @@ const VISION_TOKENS_PER_LOW_IMAGE = 2833;
 
 const COST = {
   "gpt-4o-mini": { input: 0.15 / 1_000_000, output: 0.60 / 1_000_000 },
-  "gpt-4o":      { input: 2.50 / 1_000_000, output: 10.0 / 1_000_000 },
+  "gpt-4o":      { input: 2.50 / 1_000_000, output: 5.0 / 1_000_000 },
 } as const;
-
-type ModelKey = keyof typeof COST;
 
 export interface ImageDescription {
   imageId: string;
@@ -23,6 +21,18 @@ export interface SynthesisPageInput {
   pageNumber: number;
   text: string;
   images: { filename: string; imageId: string; description: string }[];
+}
+
+/** Topic with page numbers (from Step 1) */
+export interface TopicWithPages {
+  name: string;
+  pageNumbers: number[];
+}
+
+/** Step 1 result: topics and mermaid flowchart */
+interface TopicsAndFlowchart {
+  topics: TopicWithPages[];
+  mermaidFlowchart: string;
 }
 
 export interface AnalysisResult {
@@ -51,37 +61,14 @@ export async function analyzeAndSynthesize(
   const tStep2 = performance.now();
 
   if (allImages.length > 0) {
-    const isComplex = (img: ImageWithContext) =>
-      img.width > CONFIG.complexImageMinWidth ||
-      img.byteLength > CONFIG.complexImageMinBytes;
+    console.log(`[llm] Analyzing ${allImages.length} images (${CONFIG.model})...`);
 
-    const simpleImages  = allImages.filter((img) => !isComplex(img));
-    const complexImages = allImages.filter(isComplex);
+    const batches = chunk(allImages, CONFIG.visionBatchSize);
+    const totalBatches = batches.length;
 
-    console.log(
-      `[llm] Analyzing ${allImages.length} images ` +
-        `(${simpleImages.length} simple → ${CONFIG.model}, ` +
-        `${complexImages.length} complex → ${CONFIG.premiumModel})...`
+    const batchPromises = batches.map((batch, idx) =>
+      describeImageBatch(client, batch, idx, totalBatches)
     );
-
-    const simpleBatches  = chunk(simpleImages, CONFIG.visionBatchSize);
-    const complexBatches = chunk(complexImages, CONFIG.visionBatchSize);
-    const totalBatches   = simpleBatches.length + complexBatches.length;
-
-    const batchPromises = [
-      ...simpleBatches.map((batch, idx) =>
-        describeImageBatch(client, batch, idx, totalBatches, CONFIG.model)
-      ),
-      ...complexBatches.map((batch, idx) =>
-        describeImageBatch(
-          client,
-          batch,
-          simpleBatches.length + idx,
-          totalBatches,
-          CONFIG.premiumModel
-        )
-      ),
-    ];
 
     const batchResults = await Promise.all(batchPromises);
     for (const result of batchResults) {
@@ -96,22 +83,41 @@ export async function analyzeAndSynthesize(
   const step2Cost = totalCost;
   console.log(`  Step 2 took ${step2Time}s (API cost: $${step2Cost.toFixed(4)})\n`);
 
-  // ── Step 3: Synthesize study notes ──
+  // ── Step 3: Three-step synthesis ──
   const tStep3 = performance.now();
-  console.log("[llm] Synthesizing study notes...");
-  const { notes, cost: synthCost } = await synthesizeNotes(
-    client,
-    pages,
-    imageDescriptions
+  const descMap = new Map(imageDescriptions.map((d) => [d.imageId, d]));
+
+  // Step 3a: Text-only → topics + mermaid flowchart
+  console.log("[llm] Step 3a: Extracting topics and flowchart (text only)...");
+  const { topics, mermaidFlowchart, cost: cost3a } =
+    await extractTopicsAndFlowchart(client, pages);
+  totalCost += cost3a;
+  console.log(`  Topics: ${topics.map((t) => t.name).join(", ")}`);
+
+  // Step 3b: Per-topic summarization (text + images for topic pages) — parallel
+  console.log("[llm] Step 3b: Summarizing each topic (parallel)...");
+  const step3bResults = await Promise.all(
+    topics.map((topic) => summarizeTopic(client, topic, pages, descMap))
   );
-  totalCost += synthCost;
+  const topicSummaries = step3bResults.map((r) => r.summary);
+  for (const r of step3bResults) totalCost += r.cost;
+
+  // Step 3c: Merge into final study notes using flowchart order
+  console.log("[llm] Step 3c: Merging study notes...");
+  const { notes, cost: mergeCost } = await mergeStudyNotes(
+    client,
+    topics,
+    topicSummaries,
+    mermaidFlowchart,
+    pages
+  );
+  totalCost += mergeCost;
 
   const step3Time = ((performance.now() - tStep3) / 1000).toFixed(1);
-  console.log(`  Step 3 took ${step3Time}s (API cost: $${synthCost.toFixed(4)})\n`);
+  console.log(`  Step 3 took ${step3Time}s (API cost: $${(totalCost - step2Cost).toFixed(4)})\n`);
   console.log(`[llm] Total estimated API cost: $${totalCost.toFixed(4)}`);
 
   // Build per-page synthesis input (text + image descriptions)
-  const descMap = new Map(imageDescriptions.map((d) => [d.imageId, d]));
   const synthesisInputPages: SynthesisPageInput[] = pages
     .filter((p) => p.text.length > 0 || p.images.length > 0)
     .map((p) => ({
@@ -150,8 +156,7 @@ async function describeImageBatch(
   client: OpenAI,
   batch: ImageWithContext[],
   batchIdx: number,
-  totalBatches: number,
-  model: ModelKey = CONFIG.model
+  totalBatches: number
 ): Promise<BatchResult> {
   const content: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
 
@@ -179,7 +184,7 @@ async function describeImageBatch(
   ];
 
   const resp = await client.chat.completions.create({
-    model,
+    model: CONFIG.model,
     messages,
     max_tokens: 3000,
     temperature: 0.2,
@@ -188,11 +193,11 @@ async function describeImageBatch(
   const text = resp.choices[0]?.message?.content ?? "";
   const inputTokens = resp.usage?.prompt_tokens ?? 0;
   const outputTokens = resp.usage?.completion_tokens ?? 0;
-  const rates = COST[model];
+  const rates = COST[CONFIG.model];
   const cost = inputTokens * rates.input + outputTokens * rates.output;
 
   console.log(
-    `  Batch ${batchIdx + 1}/${totalBatches} [${model}]: ${inputTokens} in / ${outputTokens} out ($${cost.toFixed(4)})`
+    `  Batch ${batchIdx + 1}/${totalBatches}: ${inputTokens} in / ${outputTokens} out ($${cost.toFixed(4)})`
   );
 
   const descriptions = parseImageDescriptions(text, batch);
@@ -219,8 +224,6 @@ For each image, reason step by step before writing the final description:
 Then output a structured description with these four parts:
 - **Main concept**: What the diagram illustrates and why it matters.
 - **Key labels**: Important text, terms, or symbols visible in the image.
-- **Relationships/processes**: Arrows, flows, steps, hierarchies, or cycles shown.
-- **Exam relevance**: What a student must remember about this diagram.
 
 Images to analyze:
 ${imageList}
@@ -273,20 +276,10 @@ function parseImageDescriptions(
   return descriptions;
 }
 
-// ── Study note synthesis ──
+// ── Study note synthesis (3 steps) ──
 
-async function synthesizeNotes(
-  client: OpenAI,
-  pages: PageData[],
-  imageDescriptions: ImageDescription[]
-): Promise<{ notes: string; cost: number }> {
-  const descMap = new Map<string, ImageDescription>();
-  for (const d of imageDescriptions) {
-    descMap.set(d.imageId, d);
-  }
-
-  // Build compact input: only pages with content
-  const textContent = pages
+function buildTextContentForPages(pages: PageData[]): string {
+  return pages
     .filter((p) => p.text.length > 0 || p.images.length > 0)
     .map((p) => {
       let entry = `[p${p.pageNumber}]`;
@@ -295,64 +288,182 @@ async function synthesizeNotes(
       return entry;
     })
     .join("\n");
+}
 
-  const allImages = pages.flatMap((p) => p.images);
-  const imageCatalog = allImages
-    .map((img) => {
-      const desc = descMap.get(img.id);
-      return `- ${img.filename}: ${desc?.description ?? "diagram/figure"}`;
-    })
-    .join("\n");
+/** Step 1: Text only → topics with page numbers + mermaid flowchart */
+async function extractTopicsAndFlowchart(
+  client: OpenAI,
+  pages: PageData[]
+): Promise<TopicsAndFlowchart & { cost: number }> {
+  const textContent = buildTextContentForPages(pages);
 
   const messages: ChatCompletionMessageParam[] = [
     {
       role: "system",
-      content: `You are an expert at turning university lectures into comprehensive, engaging study notes. Write in a descriptive, narrative style — not just bullet-point facts. Use transitions to connect ideas, explain the "why" behind concepts, and make the notes pleasant to read for longer study sessions. Diagrams are placed INLINE next to the concept they illustrate — never in a separate section.`,
+      content: `You are an expert at analyzing lecture structure. Given slide text only, identify the main topics and how they connect. Output valid JSON only.`,
     },
     {
       role: "user",
-      content: `Summarize this ${pages.length}-slide lecture into study notes that are thorough AND engaging to read.
+      content: `Analyze this ${pages.length}-slide lecture (text only below).
 
-CRITICAL FORMATTING RULE:
-- Each diagram MUST be placed IMMEDIATELY AFTER the bullet point or paragraph that discusses that concept.
-- For example, when you explain transformation, place the transformation diagram right there — NOT in a separate "diagrams" section.
-- NEVER create a dedicated images/diagrams section. Images must be woven into the text.
+1. Split the content into main TOPICS. For each topic, list the exact PAGE NUMBERS (from the [pN] markers) that belong to that topic. A page may appear in more than one topic if it spans concepts.
+2. Create a Mermaid flowchart that shows how these topics connect (e.g. prerequisite order, logical flow). Use standard Mermaid syntax (flowchart LR or TD, nodes, arrows). The flowchart should help students see the lecture structure at a glance.
 
-WRITING STYLE:
-1. Descriptive and engaging — avoid dry bullet-point fact dumps. Use narrative explanations where helpful.
-2. Connect ideas with transitions. Explain the "why" behind concepts, not just the "what."
-3. Balance thoroughness with readability. Notes should hold attention during longer study sessions.
-4. Use markdown: # title, ## major topics, ### subtopics. Mix short paragraphs with bullets where appropriate. Tables for comparisons.
-5. Include key definitions, classifications, numerical facts, and step-by-step processes — but explain their significance.
-6. IMAGES: Add images ONLY where they are critical and helpful for understanding the concept — not a fixed count. Quality over quantity. If an image does not directly aid comprehension of that specific topic, omit it. Embed as ![caption](FILENAME) inline immediately after the text that explains that concept. Do NOT add images just to fill a quota; include only diagrams that students genuinely need to see to understand the material.
-7. Use **bold** for key terms. Mark exam-critical bullets or headings with a ⭐ at the start. Aim for 1-3 sentences per point so ideas breathe.
-
-ADDITIONAL SECTIONS (append after the main notes, in this order):
-
-## Review Questions
-Add 5–8 questions that test the most important concepts from the lecture. Include a brief answer after each question (e.g. "**Q:** … **A:** …").
-
-## Glossary
-Define each bold key term introduced in the lecture in one concise sentence.
-
-## Concept Map
-Add a Mermaid flowchart showing how the lecture's top 5–7 topics connect. Use \`\`\`mermaid syntax.
-
-## Common Pitfalls
-List 3–5 misconceptions students commonly have about this material, with a brief correction for each.
+Respond with ONLY a single JSON object, no markdown or extra text:
+{
+  "topics": [
+    { "name": "Topic title", "pageNumbers": [1, 2, 3] }
+  ],
+  "mermaidFlowchart": "flowchart LR\\n  A --> B\\n  B --> C"
+}
 
 --- SLIDE TEXT ---
-${textContent}
-
---- IMAGE CATALOG (${allImages.length} images available) ---
-${imageCatalog}`,
+${textContent}`,
     },
   ];
 
   const resp = await client.chat.completions.create({
     model: CONFIG.model,
     messages,
-    max_tokens: 6000,
+    max_tokens: 4000,
+    temperature: 0,
+  });
+
+  const text = resp.choices[0]?.message?.content ?? "";
+  const inputTokens = resp.usage?.prompt_tokens ?? 0;
+  const outputTokens = resp.usage?.completion_tokens ?? 0;
+  const rates = COST[CONFIG.model];
+  const cost = inputTokens * rates.input + outputTokens * rates.output;
+
+  const parsed = parseTopicsAndFlowchart(text);
+  return { ...parsed, cost };
+}
+
+function parseTopicsAndFlowchart(text: string): TopicsAndFlowchart {
+  const trimmed = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  let data: { topics?: { name: string; pageNumbers: number[] }[]; mermaidFlowchart?: string };
+  try {
+    data = JSON.parse(trimmed) as typeof data;
+  } catch {
+    return { topics: [], mermaidFlowchart: "flowchart LR\n  A[Topics] --> B[Summary]" };
+  }
+  const topics: TopicWithPages[] = (data.topics ?? []).map((t) => ({
+    name: String(t.name ?? "Topic"),
+    pageNumbers: Array.isArray(t.pageNumbers) ? t.pageNumbers.map(Number) : [],
+  }));
+  const mermaidFlowchart = typeof data.mermaidFlowchart === "string"
+    ? data.mermaidFlowchart.trim()
+    : "flowchart LR\n  A[Topics] --> B[Summary]";
+  return { topics, mermaidFlowchart };
+}
+
+/** Step 2: For one topic, summarize text + image descriptions for its pages */
+async function summarizeTopic(
+  client: OpenAI,
+  topic: TopicWithPages,
+  pages: PageData[],
+  descMap: Map<string, ImageDescription>
+): Promise<{ summary: string; cost: number }> {
+  const pageSet = new Set(topic.pageNumbers);
+  const topicPages = pages.filter((p) => pageSet.has(p.pageNumber));
+  const textContent = topicPages
+    .filter((p) => p.text.length > 0 || p.images.length > 0)
+    .map((p) => {
+      let entry = `[p${p.pageNumber}]`;
+      if (p.text) entry += ` ${p.text}`;
+      for (const img of p.images) {
+        const desc = descMap.get(img.id);
+        entry += `\n  {{${img.filename}}}: ${desc?.description ?? "diagram"}`;
+      }
+      return entry;
+    })
+    .join("\n\n");
+
+  const messages: ChatCompletionMessageParam[] = [
+    {
+      role: "system",
+      content: `You are an expert at turning university lecture content into clear, engaging study notes. Write in a descriptive, narrative style. Place diagrams INLINE next to the concept they illustrate (as ![caption](FILENAME)). Use **bold** for key terms. Be thorough but readable.`,
+    },
+    {
+      role: "user",
+      content: `Summarize this single topic for study notes.
+
+Topic: **${topic.name}**
+Pages covered: ${topic.pageNumbers.join(", ")}
+
+RULES:
+- Write a ## ${topic.name} section with subsections (###) as needed.
+- Weave in image references where they help: use ![brief caption](FILENAME) right after the sentence that explains that concept. Only include images that are critical for understanding.
+- Descriptive and engaging; explain the "why" behind concepts. Use transitions between ideas.
+- Use markdown: **bold** for key terms, bullets and short paragraphs.
+
+--- CONTENT FOR THIS TOPIC ---
+${textContent}`,
+    },
+  ];
+
+  const resp = await client.chat.completions.create({
+    model: CONFIG.model,
+    messages,
+    max_tokens: 4000,
+    temperature: 0,
+  });
+
+  const summary = resp.choices[0]?.message?.content ?? "";
+  const inputTokens = resp.usage?.prompt_tokens ?? 0;
+  const outputTokens = resp.usage?.completion_tokens ?? 0;
+  const rates = COST[CONFIG.model];
+  const cost = inputTokens * rates.input + outputTokens * rates.output;
+
+  return { summary, cost };
+}
+
+/** Step 3: Merge topic summaries using the flowchart order and add closing sections */
+async function mergeStudyNotes(
+  client: OpenAI,
+  topics: TopicWithPages[],
+  topicSummaries: string[],
+  mermaidFlowchart: string,
+  pages: PageData[]
+): Promise<{ notes: string; cost: number }> {
+  const topicBlocks = topics
+    .map((t, i) => `### ${t.name}\n${topicSummaries[i] ?? ""}`)
+    .join("\n\n");
+
+  const messages: ChatCompletionMessageParam[] = [
+    {
+      role: "system",
+      content: `You are an expert at assembling study notes. Merge topic sections into one coherent document. Preserve the exact Mermaid diagram provided. Add a title, intro, and closing sections (Review Questions, Glossary, Common Pitfalls). Write in a descriptive, engaging style.`,
+    },
+    {
+      role: "user",
+      content: `Merge these topic-based sections into one final study note document.
+
+STRUCTURE (follow this order):
+1. # [Lecture Title] — choose a concise title from the content.
+2. Brief intro paragraph (2–4 sentences) that sets the scope of the lecture.
+3. ## Concept Map — paste the Mermaid flowchart exactly as given below (in \`\`\`mermaid ... \`\`\`).
+4. ## Main content — merge the topic sections below in the SAME order as in the flowchart. Use ## for each topic heading. Keep all inline images and formatting from each topic summary.
+5. ## Review Questions — add 5–8 questions with brief answers (**Q:** … **A:** …).
+6. ## Glossary — one-sentence definitions for key bold terms from the notes.
+7. ## Common Pitfalls — 3–5 common misconceptions with brief corrections.
+
+MERMAID FLOWCHART (use exactly):
+\`\`\`mermaid
+${mermaidFlowchart}
+\`\`\`
+
+TOPIC SECTIONS TO MERGE (in flowchart order):
+${topicBlocks}
+
+Produce the full study notes as a single markdown document.`,
+    },
+  ];
+
+  const resp = await client.chat.completions.create({
+    model: CONFIG.model,
+    messages,
+    max_tokens: 10000,
     temperature: 0,
   });
 
@@ -363,7 +474,7 @@ ${imageCatalog}`,
   const cost = inputTokens * rates.input + outputTokens * rates.output;
 
   console.log(
-    `  Synthesis: ${inputTokens} in / ${outputTokens} out ($${cost.toFixed(4)})`
+    `  Merge: ${inputTokens} in / ${outputTokens} out ($${cost.toFixed(4)})`
   );
 
   return { notes, cost };
